@@ -1,0 +1,7 @@
+name: cloudflare-agent-memory
+version: 0.1.0
+description: "Cloudflare Agent Memory recall, explicit memory, and checkpointed conversation ingestion for Hermes."
+hooks:
+  - on_session_end
+  - on_pre_compress
+  - on_memory_write
