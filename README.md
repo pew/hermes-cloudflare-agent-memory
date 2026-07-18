@@ -22,8 +22,8 @@ Prerequisites: current Hermes, Git, a Cloudflare account with Agent Memory beta 
 # Create a namespace once (32 characters maximum).
 npx wrangler agent-memory namespace create hermes-prod
 
-# Install from this repository. Replace <owner> with the GitHub owner.
-hermes plugins install <owner>/hermes-cloudflare-agent-memory --no-enable
+# Install this plugin from GitHub.
+hermes plugins install pew/hermes-cloudflare-agent-memory --no-enable
 
 # Store account ID + namespace in the profile config and the token in .env.
 hermes memory setup cloudflare-agent-memory
