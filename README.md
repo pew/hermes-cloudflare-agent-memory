@@ -58,6 +58,32 @@ Profiles are derived from trusted Hermes runtime identity. Identified gateway us
 
 Migration never deletes or edits local memory or exports. It adds current entries and may delete only stale Cloudflare curated sessions previously recorded in the plugin's content-free mirror manifest.
 
+### Import from Claude, ChatGPT, or another service
+
+Ask the source service to format its memory with this prompt:
+
+```text
+Export the durable memory you have about me for Hermes. Return exactly two
+plain-text code blocks named USER.md and MEMORY.md.
+
+Put stable facts about me, preferences, corrections, response instructions,
+and workflow habits in USER.md. Put reusable project facts, environment details,
+conventions, and tool notes in MEMORY.md.
+
+Within each block, write concise standalone entries separated by a line containing
+only §. Do not include headings, bullets, numbering, commentary, duplicates,
+inferred facts, secrets, or credentials. Leave a block empty if it has no entries.
+```
+
+Run `hermes backup`, merge the block contents into the active profile's `$HERMES_HOME/memories/USER.md` and `MEMORY.md`, then:
+
+```sh
+hermes cloudflare-agent-memory migrate --dry-run
+hermes cloudflare-agent-memory migrate --apply
+```
+
+### Migrate Hermes memory and sessions
+
 ```sh
 # Back up Hermes first.
 hermes backup
