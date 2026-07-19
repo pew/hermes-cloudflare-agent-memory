@@ -37,8 +37,6 @@ For an automated Hermes installation: run those commands in order, ask the opera
 
 Hermes writes non-secrets to `$HERMES_HOME/cloudflare-agent-memory.json` and the token to `$HERMES_HOME/.env`. Both should remain mode `0600`.
 
-Cloudflare's public beta docs currently say the token needs “appropriate Agent Memory permissions,” but neither the Agent Memory guide nor the official permission catalog names a permission label as of 2026-07-16. Do not guess: select the Agent Memory permission exposed to your beta-enabled account or confirm it with Cloudflare beta onboarding, scope it to the target account, and verify it with the status command.
-
 ## Use
 
 Hermes receives four model-visible tools:
