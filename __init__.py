@@ -221,7 +221,7 @@ def _update_curated_manifest(
 
 RECALL_SCHEMA = {
     "name": "cloudflare_memory_recall",
-    "description": "Recall relevant facts from this user's long-term Cloudflare memory.",
+    "description": "Recall relevant curated and runtime facts from Cloudflare memory.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -247,11 +247,14 @@ REMEMBER_SCHEMA = {
 
 FORGET_SCHEMA = {
     "name": "cloudflare_memory_forget",
-    "description": "Delete one memory by its exact ID after the user explicitly asks to forget it.",
+    "description": "Delete one runtime memory by its exact recalled ID after an explicit user request.",
     "parameters": {
         "type": "object",
         "properties": {
-            "memory_id": {"type": "string", "description": "Exact ID returned by recall."}
+            "memory_id": {
+                "type": "string",
+                "description": "Exact runtime-memory ID returned by recall.",
+            }
         },
         "required": ["memory_id"],
         "additionalProperties": False,
@@ -260,7 +263,7 @@ FORGET_SCHEMA = {
 
 SUMMARY_SCHEMA = {
     "name": "cloudflare_memory_summary",
-    "description": "Summarize what Cloudflare Agent Memory stores for this user.",
+    "description": "Summarize curated and runtime Cloudflare memory.",
     "parameters": {
         "type": "object",
         "properties": {},
@@ -280,6 +283,7 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
         self._session_id = ""
         self._write_enabled = True
         self._client: CloudflareMemoryClient | None = None
+        self._recalled_memory_profiles: dict[str, tuple[str, str]] = {}
         self._buffers: dict[str, list[dict[str, str]]] = {}
         self._buffer_profiles: dict[str, str] = {}
         self._buffer_generations: dict[str, int] = {}
@@ -405,6 +409,7 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
         self._curated_profile = derived_profile_name(
             agent_identity, "cli", "", "cloudflare-memory-cli"
         )
+        self._recalled_memory_profiles.clear()
         self._write_enabled = kwargs.get("agent_context", "") not in {
             "cron",
             "flush",
@@ -434,7 +439,8 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
             "may matter. Treat recalled material as fallible context and verify it before "
             "irreversible actions. Use cloudflare_memory_remember only for durable, non-secret "
             "facts or explicit requests to remember. Use cloudflare_memory_forget only with an "
-            "exact recalled ID after an explicit user request."
+            "exact recalled runtime-memory ID after an explicit user request; remove curated "
+            "memory with Hermes' built-in memory tool."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -577,6 +583,7 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
 
     def on_session_switch(self, new_session_id: str, **kwargs: Any) -> None:
         destination = normalize_session_id(new_session_id)
+        self._recalled_memory_profiles.clear()
         if kwargs.get("rewound"):
             with self._remote_session_lock:
                 if self._write_enabled and self._client:
@@ -928,28 +935,65 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
         if not self._write_enabled:
             raise ValueError("writes are disabled outside the primary agent context")
 
+    def _read_profiles(self) -> list[tuple[str, str]]:
+        if self._curated_profile == self._profile:
+            return [("runtime", self._profile)]
+        return [("curated", self._curated_profile), ("runtime", self._profile)]
+
     def _tool_recall(self, args: dict[str, Any]) -> dict:
         query = sanitize_context(str(args.get("query") or ""))
         query = redact_sensitive_text(query, force=True).strip()
         if not query:
             raise ValueError("query is required")
-        try:
-            result = self._client.recall(self._profile, query)
-        except CloudflareMemoryError as exc:
-            if exc.status != 404:
-                raise
-            self._client.get_namespace()
-            return {"answer": "", "count": 0, "candidates": []}
+        profiles = self._read_profiles()
+        answers = []
         candidates = []
-        for item in result.get("candidates") or []:
-            if not isinstance(item, dict):
-                continue
-            candidates.append(
-                {key: item[key] for key in ("id", "summary", "score") if key in item}
+        seen_ids = set()
+        recalled_profiles: dict[str, tuple[str, str]] = {}
+        curated_sessions = {
+            (profile, session_id)
+            for destination_id, profile, _target, _source_hash, session_id in _load_curated_manifest(
+                self._hermes_home
             )
+            if destination_id == self._client.destination_id
+        }
+        for scope, profile in profiles:
+            try:
+                result = self._client.recall(profile, query)
+            except CloudflareMemoryError as exc:
+                if exc.status != 404:
+                    raise
+                self._client.get_namespace()
+                continue
+            answer = str(result.get("answer") or "")
+            if answer:
+                title = "Durable memory" if scope == "curated" else "Runtime identity"
+                answers.append(f"## {title}\n{answer}")
+            for item in result.get("candidates") or []:
+                if not isinstance(item, dict):
+                    continue
+                memory_id = item.get("id")
+                if isinstance(memory_id, str) and memory_id:
+                    if memory_id in seen_ids:
+                        continue
+                    seen_ids.add(memory_id)
+                item_scope = scope
+                if (
+                    len(profiles) == 1
+                    and (profile, str(item.get("sessionId") or "")) in curated_sessions
+                ):
+                    item_scope = "curated"
+                candidate = {
+                    key: item[key] for key in ("id", "summary", "score") if key in item
+                }
+                candidate["scope"] = item_scope
+                candidates.append(candidate)
+                if isinstance(memory_id, str) and memory_id:
+                    recalled_profiles[memory_id] = (profile, item_scope)
+        self._recalled_memory_profiles.update(recalled_profiles)
         return {
-            "answer": str(result.get("answer") or ""),
-            "count": int(result.get("count") or len(candidates)),
+            "answer": "\n\n".join(answers),
+            "count": len(candidates),
             "candidates": candidates,
         }
 
@@ -969,18 +1013,36 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
         memory_id = str(args.get("memory_id") or "").strip()
         if not memory_id:
             raise ValueError("memory_id is required")
-        self._client.delete_memory(self._profile, memory_id)
+        recalled = self._recalled_memory_profiles.get(memory_id)
+        if recalled is None:
+            raise ValueError("memory_id must be an exact ID returned by recall")
+        profile, scope = recalled
+        if scope == "curated":
+            raise ValueError("curated Hermes memory must be removed with the Hermes memory tool")
+        self._client.delete_memory(profile, memory_id)
+        self._recalled_memory_profiles.pop(memory_id, None)
         return {"forgotten": True, "id": memory_id}
 
     def _tool_summary(self) -> dict[str, str]:
-        try:
-            summary = self._client.summary(self._profile)
-        except CloudflareMemoryError as exc:
-            if exc.status != 404:
-                raise
-            self._client.get_namespace()
-            summary = ""
-        return {"summary": summary}
+        profiles = self._read_profiles()
+        summaries = []
+        for scope, profile in profiles:
+            try:
+                summary = self._client.summary(profile)
+            except CloudflareMemoryError as exc:
+                if exc.status != 404:
+                    raise
+                self._client.get_namespace()
+                continue
+            if not summary:
+                continue
+            title = (
+                "Durable curated memory"
+                if scope == "curated"
+                else "Runtime identity memory"
+            )
+            summaries.append(f"## {title}\n{summary}")
+        return {"summary": "\n\n".join(summaries)}
 
     def _current_profile_delete_pending(self) -> bool:
         if not self._client:

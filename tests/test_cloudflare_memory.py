@@ -404,6 +404,7 @@ class ProviderContractTests(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
 
     def test_recall_returns_answer_and_candidates(self) -> None:
+        self.provider._profile = self.provider._curated_profile
         self.server.queue(
             200,
             {
@@ -422,11 +423,162 @@ class ProviderContractTests(unittest.TestCase):
             self.provider.handle_tool_call("cloudflare_memory_recall", {"query": "editor"})
         )
 
-        self.assertEqual("You use Neovim", result["answer"])
+        self.assertEqual("## Runtime identity\nYou use Neovim", result["answer"])
         self.assertEqual(
-            {"id": "mem-1", "summary": "Uses Neovim", "score": 0.9},
+            {"id": "mem-1", "summary": "Uses Neovim", "score": 0.9, "scope": "runtime"},
             result["candidates"][0],
         )
+
+    def test_recall_combines_curated_and_runtime_profiles(self) -> None:
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {
+                    "answer": "You prefer concise answers.",
+                    "count": 2,
+                    "candidates": [
+                        {"id": "durable", "summary": "Concise", "score": 0.9},
+                        {"id": "shared", "summary": "Shared", "score": 0.8},
+                    ],
+                },
+                "errors": [],
+                "messages": [],
+            },
+        )
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {
+                    "answer": "This session uses Neovim.",
+                    "count": 2,
+                    "candidates": [
+                        {"id": "session", "summary": "Neovim", "score": 0.95},
+                        {"id": "shared", "summary": "Shared", "score": 0.7},
+                    ],
+                },
+                "errors": [],
+                "messages": [],
+            },
+        )
+
+        result = json.loads(
+            self.provider.handle_tool_call("cloudflare_memory_recall", {"query": "preferences"})
+        )
+
+        self.assertEqual(
+            "## Durable memory\nYou prefer concise answers.\n\n"
+            "## Runtime identity\nThis session uses Neovim.",
+            result["answer"],
+        )
+        self.assertEqual(3, result["count"])
+        self.assertEqual(
+            [
+                {"id": "durable", "summary": "Concise", "score": 0.9, "scope": "curated"},
+                {"id": "shared", "summary": "Shared", "score": 0.8, "scope": "curated"},
+                {"id": "session", "summary": "Neovim", "score": 0.95, "scope": "runtime"},
+            ],
+            result["candidates"],
+        )
+        self.assertIn(f"/profiles/{self.provider._curated_profile}/recall", self.server.requests[0]["path"])
+        self.assertIn(f"/profiles/{self.provider._profile}/recall", self.server.requests[1]["path"])
+
+    def test_recall_uses_curated_when_runtime_profile_is_missing(self) -> None:
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {"answer": "Durable fact", "count": 0, "candidates": []},
+                "errors": [],
+                "messages": [],
+            },
+        )
+        self.server.queue(
+            404,
+            {
+                "success": False,
+                "result": None,
+                "errors": [{"code": 10010, "message": "Profile not found"}],
+                "messages": [],
+            },
+        )
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {"name": "namespace"},
+                "errors": [],
+                "messages": [],
+            },
+        )
+
+        result = json.loads(
+            self.provider.handle_tool_call("cloudflare_memory_recall", {"query": "fact"})
+        )
+
+        self.assertEqual("## Durable memory\nDurable fact", result["answer"])
+        self.assertEqual(["POST", "POST", "GET"], [r["method"] for r in self.server.requests])
+
+    def test_recall_uses_runtime_profile_when_curated_profile_is_missing(self) -> None:
+        self.server.queue(
+            404,
+            {
+                "success": False,
+                "result": None,
+                "errors": [{"code": 10010, "message": "Profile not found"}],
+                "messages": [],
+            },
+        )
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {"name": "namespace"},
+                "errors": [],
+                "messages": [],
+            },
+        )
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {"answer": "Session fact", "count": 0, "candidates": []},
+                "errors": [],
+                "messages": [],
+            },
+        )
+
+        result = json.loads(
+            self.provider.handle_tool_call("cloudflare_memory_recall", {"query": "fact"})
+        )
+
+        self.assertEqual("## Runtime identity\nSession fact", result["answer"])
+        self.assertEqual(["POST", "GET", "POST"], [r["method"] for r in self.server.requests])
+
+    def test_identical_profiles_are_recalled_once(self) -> None:
+        self.provider._profile = self.provider._curated_profile
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {
+                    "answer": "One profile",
+                    "count": 1,
+                    "candidates": [{"id": "one", "summary": "One", "score": 1.0}],
+                },
+                "errors": [],
+                "messages": [],
+            },
+        )
+
+        result = json.loads(
+            self.provider.handle_tool_call("cloudflare_memory_recall", {"query": "fact"})
+        )
+
+        self.assertEqual("## Runtime identity\nOne profile", result["answer"])
+        self.assertEqual("runtime", result["candidates"][0]["scope"])
+        self.assertEqual(1, len(self.server.requests))
 
     def test_recall_redacts_model_generated_query_before_http(self) -> None:
         sensitive_value = "ghp_" + "A" * 36
@@ -463,6 +615,36 @@ class ProviderContractTests(unittest.TestCase):
         )
         self.assertIn("error", missing)
         self.assertEqual([], self.server.requests)
+        unknown = json.loads(
+            self.provider.handle_tool_call(
+                "cloudflare_memory_forget", {"memory_id": "mem/one"}
+            )
+        )
+        self.assertIn("error", unknown)
+        self.assertEqual([], self.server.requests)
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {"answer": "", "count": 0, "candidates": []},
+                "errors": [],
+                "messages": [],
+            },
+        )
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {
+                    "answer": "Uses Neovim",
+                    "count": 1,
+                    "candidates": [{"id": "mem/one", "summary": "Uses Neovim", "score": 0.9}],
+                },
+                "errors": [],
+                "messages": [],
+            },
+        )
+        self.provider.handle_tool_call("cloudflare_memory_recall", {"query": "editor"})
         self.server.queue(
             200,
             {"success": True, "result": {"id": "mem/one"}, "errors": [], "messages": []},
@@ -475,10 +657,126 @@ class ProviderContractTests(unittest.TestCase):
         )
 
         self.assertEqual("mem/one", result["id"])
-        self.assertEqual("DELETE", self.server.requests[0]["method"])
-        self.assertIn("/memories/mem%2Fone", self.server.requests[0]["path"])
+        self.assertEqual("DELETE", self.server.requests[-1]["method"])
+        self.assertIn(f"/profiles/{self.provider._profile}/memories/mem%2Fone", self.server.requests[-1]["path"])
+
+    def test_forget_rejects_recalled_curated_memory(self) -> None:
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {
+                    "answer": "Durable",
+                    "count": 1,
+                    "candidates": [{"id": "durable", "summary": "Durable", "score": 1.0}],
+                },
+                "errors": [],
+                "messages": [],
+            },
+        )
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {"answer": "", "count": 0, "candidates": []},
+                "errors": [],
+                "messages": [],
+            },
+        )
+        self.provider.handle_tool_call("cloudflare_memory_recall", {"query": "durable"})
+        request_count = len(self.server.requests)
+
+        result = json.loads(
+            self.provider.handle_tool_call(
+                "cloudflare_memory_forget", {"memory_id": "durable"}
+            )
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("Hermes memory", result["error"])
+        self.assertEqual(request_count, len(self.server.requests))
+
+    def test_latest_runtime_recall_replaces_stale_curated_authorization(self) -> None:
+        recall_results = [
+            [{"id": "shared", "summary": "Durable", "score": 1.0}],
+            [],
+            [],
+            [{"id": "shared", "summary": "Runtime", "score": 1.0}],
+        ]
+        for candidates in recall_results:
+            self.server.queue(
+                200,
+                {
+                    "success": True,
+                    "result": {
+                        "answer": "",
+                        "count": len(candidates),
+                        "candidates": candidates,
+                    },
+                    "errors": [],
+                    "messages": [],
+                },
+            )
+        self.server.queue(
+            200,
+            {"success": True, "result": {"id": "shared"}, "errors": [], "messages": []},
+        )
+
+        self.provider.handle_tool_call("cloudflare_memory_recall", {"query": "first"})
+        recalled = json.loads(
+            self.provider.handle_tool_call("cloudflare_memory_recall", {"query": "second"})
+        )
+        forgotten = json.loads(
+            self.provider.handle_tool_call(
+                "cloudflare_memory_forget", {"memory_id": "shared"}
+            )
+        )
+
+        self.assertEqual("runtime", recalled["candidates"][0]["scope"])
+        self.assertTrue(forgotten["forgotten"])
+        self.assertIn(
+            f"/profiles/{self.provider._profile}/memories/shared",
+            self.server.requests[-1]["path"],
+        )
+
+    def test_failed_combined_recall_does_not_authorize_partial_candidates(self) -> None:
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {
+                    "answer": "Durable",
+                    "count": 1,
+                    "candidates": [{"id": "not-returned", "summary": "Durable", "score": 1.0}],
+                },
+                "errors": [],
+                "messages": [],
+            },
+        )
+        self.server.queue(
+            500,
+            {
+                "success": False,
+                "result": None,
+                "errors": [{"code": 10001, "message": "temporary failure"}],
+                "messages": [],
+            },
+        )
+        recall = json.loads(
+            self.provider.handle_tool_call("cloudflare_memory_recall", {"query": "durable"})
+        )
+
+        result = json.loads(
+            self.provider.handle_tool_call(
+                "cloudflare_memory_forget", {"memory_id": "not-returned"}
+            )
+        )
+
+        self.assertIn("error", recall)
+        self.assertIn("exact ID returned by recall", result["error"])
 
     def test_summary_returns_markdown(self) -> None:
+        self.provider._profile = self.provider._curated_profile
         self.server.queue(
             200,
             {
@@ -493,9 +791,70 @@ class ProviderContractTests(unittest.TestCase):
             self.provider.handle_tool_call("cloudflare_memory_summary", {})
         )
 
-        self.assertEqual("## Summary\n\nUses Neovim", result["summary"])
+        self.assertEqual(
+            "## Runtime identity memory\n## Summary\n\nUses Neovim",
+            result["summary"],
+        )
+
+    def test_summary_combines_curated_and_runtime_profiles(self) -> None:
+        for summary in ("Durable summary", "Session summary"):
+            self.server.queue(
+                200,
+                {
+                    "success": True,
+                    "result": {"summary": summary},
+                    "errors": [],
+                    "messages": [],
+                },
+            )
+
+        result = json.loads(
+            self.provider.handle_tool_call("cloudflare_memory_summary", {})
+        )
+
+        self.assertEqual(
+            "## Durable curated memory\nDurable summary\n\n"
+            "## Runtime identity memory\nSession summary",
+            result["summary"],
+        )
+
+    def test_summary_omits_a_missing_curated_profile(self) -> None:
+        self.server.queue(
+            404,
+            {
+                "success": False,
+                "result": None,
+                "errors": [{"code": 10010, "message": "Profile not found"}],
+                "messages": [],
+            },
+        )
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {"name": "namespace"},
+                "errors": [],
+                "messages": [],
+            },
+        )
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {"summary": "Session summary"},
+                "errors": [],
+                "messages": [],
+            },
+        )
+
+        result = json.loads(
+            self.provider.handle_tool_call("cloudflare_memory_summary", {})
+        )
+
+        self.assertEqual("## Runtime identity memory\nSession summary", result["summary"])
 
     def test_recall_and_summary_are_empty_when_profile_does_not_exist(self) -> None:
+        self.provider._profile = self.provider._curated_profile
         missing = {
             "success": False,
             "result": None,

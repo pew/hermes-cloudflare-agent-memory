@@ -41,16 +41,17 @@ Hermes writes non-secrets to `$HERMES_HOME/cloudflare-agent-memory.json` and the
 
 Hermes receives four model-visible tools:
 
-- `cloudflare_memory_recall` — recall relevant prior facts;
+- `cloudflare_memory_recall` — recall curated and current runtime facts;
 - `cloudflare_memory_remember` — save one durable, non-secret fact;
-- `cloudflare_memory_forget` — delete one exact recalled memory ID;
-- `cloudflare_memory_summary` — inspect the current profile's stored summary.
+- `cloudflare_memory_forget` — delete one exact recalled runtime-memory ID;
+- `cloudflare_memory_summary` — inspect curated and current runtime summaries.
 
 Conversation text is buffered and ingested only at 500-message boundaries, session end, context compression, session switch, or shutdown. Cloudflare failures do not fail an ordinary Hermes turn; unsent checkpoint data stays buffered for a later retry while the process remains alive.
 
 Hermes `/undo` clears unsent buffered turns and deletes the exact remote session so undone content is not retained. This also removes earlier Cloudflare extraction from that session; local Hermes history remains the source for any deliberate re-migration.
 
 Profiles are derived from trusted Hermes runtime identity. Identified gateway users are isolated by platform and user; unidentified non-CLI callers are isolated per session; local CLI sessions share the active Hermes profile's memory.
+Curated `MEMORY.md` / `USER.md` remains active-Hermes-profile-wide, matching Hermes' built-in memory scope, and must be removed with Hermes' built-in memory tool.
 
 ## Migrate existing data
 
