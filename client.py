@@ -260,7 +260,7 @@ class CloudflareMemoryClient:
         self, profile: str, *, session_id: str = "", cursor: str = ""
     ) -> dict:
         self._validate_profile(profile)
-        query: dict[str, str | int] = {"per_page": 1000}
+        query: dict[str, str | int] = {"per_page": 500}
         if session_id:
             self._validate_session(session_id)
             query["session_id"] = session_id

@@ -244,6 +244,7 @@ class ClientContractTests(unittest.TestCase):
         )
 
         self.assertEqual({"result": [], "result_info": {"cursor": ""}}, result)
+        self.assertIn("per_page=500", self.server.requests[0]["path"])
         self.assertIn("session_id=session%2Fone", self.server.requests[0]["path"])
         self.assertIn("cursor=next+cursor", self.server.requests[0]["path"])
 
