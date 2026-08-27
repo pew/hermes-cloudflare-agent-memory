@@ -2,7 +2,7 @@
 
 [Hermes memory-provider plugin](https://hermes-agent.nousresearch.com/docs/developer-guide/memory-provider-plugin) for [Cloudflare Agent Memory](https://developers.cloudflare.com/agent-memory/).
 
-It adds explicit recall, remember, exact forget, summaries, checkpointed conversation ingestion, and a dry-run-first migration from existing Hermes memory.
+It makes Cloudflare Agent Memory the primary Hermes memory store. It adds recall, remember, exact forget, summaries, checkpoint ingestion, migration, and full JSONL export.
 
 ## Data boundary
 
@@ -12,11 +12,11 @@ The plugin sends only:
 - curated `MEMORY.md` and `USER.md` entries after strict threat scanning and redaction;
 - opaque profile and session identifiers.
 
-It never sends system prompts, tool calls/results, terminal output, files, API tokens, raw gateway user IDs, or other profiles' memory. Local Hermes memory remains the recovery source. Content-free failed-delete tombstones and rewind generations are kept in `$HERMES_HOME/cloudflare-agent-memory-pending.json`; a content-free curated mirror manifest is kept in `$HERMES_HOME/cloudflare-agent-memory-curated.json`. Both are bound to opaque account/namespace and profile identifiers.
+It never sends system prompts, tool calls/results, terminal output, files, API tokens, raw gateway user IDs, or other profiles' memory. Existing local Hermes memory remains an unchanged source for migration and recovery of those local entries. Content-free failed-delete tombstones and rewind generations are kept in `$HERMES_HOME/cloudflare-agent-memory-pending.json`; a content-free curated migration manifest is kept in `$HERMES_HOME/cloudflare-agent-memory-curated.json`. Both are bound to opaque account/namespace and profile identifiers.
 
 ## Install
 
-Prerequisites: current Hermes, Git, a Cloudflare account with Agent Memory beta access, an Agent Memory namespace, and a dedicated account-scoped API token.
+Prerequisites: Hermes 0.20.5 or newer, Git, a Cloudflare account with Agent Memory beta access, an Agent Memory namespace, and a dedicated account-scoped API token.
 
 ```sh
 # Create a namespace once (32 characters maximum).
@@ -27,6 +27,10 @@ hermes plugins install pew/hermes-cloudflare-agent-memory --no-enable
 
 # Store account ID + namespace in the profile config and the token in .env.
 hermes memory setup cloudflare-agent-memory
+
+# If local MEMORY.md or USER.md contains data, review and apply its migration.
+hermes cloudflare-agent-memory migrate --dry-run
+hermes cloudflare-agent-memory migrate --apply
 
 # Confirm activation and live API access.
 hermes memory status
@@ -43,19 +47,25 @@ Hermes receives four model-visible tools:
 
 - `cloudflare_memory_recall` — recall curated and current runtime facts;
 - `cloudflare_memory_remember` — save one durable, non-secret fact;
-- `cloudflare_memory_forget` — delete one exact recalled runtime-memory ID;
+- `cloudflare_memory_forget` — delete one exact recalled memory ID;
 - `cloudflare_memory_summary` — inspect curated and current runtime summaries.
 
-When this provider is active, Hermes uses `cloudflare_memory_remember` for all
-new durable memory. The built-in memory tool only edits existing curated
-`MEMORY.md` and `USER.md` entries.
+Setup sets `memory.memory_enabled` and `memory.user_profile_enabled` to `false`.
+This removes Hermes' built-in `memory` tool, including its local character
+limits. Cloudflare tools then own all model-visible durable memory operations.
+Start a new Hermes session after setup or update so the tool surface reloads.
 
 Conversation text is buffered and ingested only at 500-message boundaries, session end, context compression, session switch, or shutdown. Cloudflare failures do not fail an ordinary Hermes turn; unsent checkpoint data stays buffered for a later retry while the process remains alive.
 
 Hermes `/undo` clears unsent buffered turns and deletes the exact remote session so undone content is not retained. This also removes earlier Cloudflare extraction from that session; local Hermes history remains the source for any deliberate re-migration.
 
 Profiles are derived from trusted Hermes runtime identity. Identified gateway users are isolated by platform and user; unidentified non-CLI callers are isolated per session; local CLI sessions share the active Hermes profile's memory.
-Curated `MEMORY.md` / `USER.md` remains active-Hermes-profile-wide, matching Hermes' built-in memory scope, and must be removed with Hermes' built-in memory tool.
+
+Setup does not edit or delete local `MEMORY.md` or `USER.md` files. Hermes no
+longer injects them after setup. Use the migration commands to copy their
+entries to Cloudflare. `cloudflare_memory_forget` can delete an exact migrated
+memory after recall. A later migration will import that entry again if it still
+exists in the local source file.
 
 ## Migrate existing data
 
@@ -117,14 +127,58 @@ hermes cloudflare-agent-memory status
 
 Content-free JSONL reports are written under `$HERMES_HOME/cloudflare-agent-memory-migrations/`. They record rejected source hashes, every planned operation before remote writes begin, and final applied/skipped/failed results. A nonzero exit means at least one input row or remote operation failed; fix the cause and rerun the same command.
 
+## Export data
+
+Export the active Hermes profile before you change memory providers:
+
+```sh
+hermes cloudflare-agent-memory export --output cloudflare-memory.jsonl
+```
+
+The first JSONL row identifies the format, version, namespace, and exported
+profiles. Each remaining row contains an opaque profile name and one complete
+Cloudflare memory object. The export keeps all fields that the Cloudflare API
+returns, including the full memory content.
+
+The command reads all memory pages and fetches the full content for each memory.
+It does not change Cloudflare data. It writes the file atomically with mode
+`0600`, and it refuses to replace an existing file.
+
+Use `--profile` to export a known isolated gateway profile. Repeat this option
+to export more than one profile:
+
+```sh
+hermes cloudflare-agent-memory export \
+  --output gateway-memory.jsonl \
+  --profile hermes-example-profile-one \
+  --profile hermes-example-profile-two
+```
+
+The current [Cloudflare HTTP API](https://developers.cloudflare.com/agent-memory/api/http-api/)
+does not provide profile enumeration. The default export therefore contains the
+active Hermes profile. Treat every export file as sensitive data.
+
 ## Roll back, update, or remove
 
 ```sh
-# Immediately return to built-in-only memory. Local data is unchanged.
+# Export Cloudflare memory before a provider change.
+hermes cloudflare-agent-memory export --output cloudflare-memory.jsonl
+
+# Change to another external provider. Start a new session after setup.
+hermes memory setup honcho
+
+# Restore built-in memory before disabling the provider.
+hermes config set memory.memory_enabled true
+hermes config set memory.user_profile_enabled true
 hermes memory off
 
 hermes plugins update cloudflare-agent-memory
+hermes memory setup cloudflare-agent-memory
 hermes plugins remove cloudflare-agent-memory
 ```
 
-Disabling or removing the plugin does not delete Cloudflare data. Delete remote memories, sessions, profiles, or the namespace separately only when that is explicitly intended.
+`hermes memory off` does not change the two built-in store flags. Run both
+`hermes config set` commands first when you want built-in-only memory.
+Disabling or removing the plugin does not delete Cloudflare data or local
+memory files. Delete remote memories, sessions, profiles, or the namespace
+separately only when that is explicitly intended.

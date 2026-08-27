@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
 import sys
+import tempfile
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +51,84 @@ def _memory_count(provider: CloudflareAgentMemoryProvider) -> int:
         cursor = str((page.get("result_info") or {}).get("cursor") or "")
         if not cursor:
             return count
+
+
+def _export_memories(
+    provider: CloudflareAgentMemoryProvider,
+    profiles: list[str],
+    output: Path,
+) -> int:
+    if output.exists():
+        raise ValueError(f"output already exists: {output}")
+    profiles = list(dict.fromkeys(profiles))
+    temporary: Path | None = None
+    count = 0
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+
+            def write(row: dict) -> None:
+                stream.write(
+                    json.dumps(
+                        row,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+
+            write(
+                {
+                    "format": "cloudflare-agent-memory-export",
+                    "version": 1,
+                    "namespace": provider._client.namespace,
+                    "profiles": profiles,
+                }
+            )
+            for profile in profiles:
+                cursor = ""
+                seen_cursors = set()
+                while True:
+                    page = provider._client.list_memories(profile, cursor=cursor)
+                    memories = page.get("result")
+                    if not isinstance(memories, list):
+                        raise ValueError("invalid memory list response")
+                    for item in memories:
+                        memory_id = item.get("id") if isinstance(item, dict) else None
+                        if not isinstance(memory_id, str) or not memory_id:
+                            raise ValueError("memory list entry has no ID")
+                        memory = provider._client.get_memory(profile, memory_id)
+                        if not memory:
+                            raise ValueError(f"memory is empty: {memory_id}")
+                        if memory.get("id") != memory_id:
+                            raise ValueError(
+                                f"memory response ID does not match: {memory_id}"
+                            )
+                        write({"profile": profile, "memory": memory})
+                        count += 1
+                    cursor = str((page.get("result_info") or {}).get("cursor") or "")
+                    if not cursor:
+                        break
+                    if cursor in seen_cursors:
+                        raise ValueError("memory list returned a repeated cursor")
+                    seen_cursors.add(cursor)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, output)
+        except FileExistsError:
+            raise ValueError(f"output already exists: {output}") from None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return count
 
 
 def cloudflare_memory_command(args) -> int:
@@ -111,9 +192,16 @@ def cloudflare_memory_command(args) -> int:
                 f"failed={applied.failed} report={report}"
             )
             return 1 if planning.planning_errors or applied.failed else 0
-        print("Choose status or migrate.", file=sys.stderr)
+        if args.cloudflare_memory_command == "export":
+            if not provider._client:
+                raise ValueError("provider is not configured")
+            profiles = args.profile or [provider._profile]
+            count = _export_memories(provider, profiles, args.output)
+            print(f"Exported {count} memories to {args.output}")
+            return 0
+        print("Choose status, migrate, or export.", file=sys.stderr)
         return 1
-    except (CloudflareMemoryError, RuntimeError, ValueError) as exc:
+    except (CloudflareMemoryError, OSError, RuntimeError, ValueError) as exc:
         print(f"Cloudflare Agent Memory: {exc}", file=sys.stderr)
         return 1
     finally:
@@ -132,4 +220,13 @@ def register_cli(subparser) -> None:
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--apply", action="store_true")
     migrate.add_argument("--sessions-jsonl", type=Path)
+    export = commands.add_parser(
+        "export", help="Export full Cloudflare memories to JSONL"
+    )
+    export.add_argument("--output", type=Path, required=True)
+    export.add_argument(
+        "--profile",
+        action="append",
+        help="Export this opaque profile name; repeat for more profiles",
+    )
     subparser.set_defaults(func=cloudflare_memory_command)

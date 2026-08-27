@@ -345,6 +345,15 @@ class ProviderContractTests(unittest.TestCase):
             self.assertFalse(self.plugin.CloudflareAgentMemoryProvider().is_available())
         self.assertEqual([], self.server.requests)
 
+    def test_is_unavailable_when_hermes_cannot_hide_the_builtin_memory_tool(self) -> None:
+        with patch.object(
+            self.plugin,
+            "_supports_cloudflare_primary_mode",
+            return_value=False,
+        ):
+            self.assertFalse(self.provider.is_available())
+            self.assertIn("upgrade Hermes", self.provider.unavailable_reason())
+
     def test_save_config_is_profile_scoped_and_mode_0600(self) -> None:
         other_home = self.home / "profile-home"
 
@@ -362,15 +371,25 @@ class ProviderContractTests(unittest.TestCase):
 
     def test_post_setup_prompts_and_writes_activation_config_and_secret(self) -> None:
         from hermes_cli.config import load_config
+        from tools.memory_tool import (
+            check_memory_requirements,
+            get_builtin_memory_store_flags,
+        )
+
+        config = {
+            "agent": {"max_turns": 42},
+            "memory": {"nudge_interval": 9},
+        }
+        stdout = io.StringIO()
 
         with (
             patch(
                 "hermes_cli.memory_setup._prompt",
                 side_effect=["new-account", "hermes-prod", "fixture"],
             ),
-            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stdout(stdout),
         ):
-            self.provider.post_setup(str(self.home), {})
+            self.provider.post_setup(str(self.home), config)
 
         self.assertEqual(
             {"account_id": "new-account", "namespace": "hermes-prod"},
@@ -381,9 +400,52 @@ class ProviderContractTests(unittest.TestCase):
             (self.home / ".env").read_text(),
         )
         self.assertEqual(0o600, stat.S_IMODE((self.home / ".env").stat().st_mode))
-        self.assertEqual(
-            "cloudflare-agent-memory", load_config()["memory"]["provider"]
+        saved = load_config()
+        self.assertEqual("cloudflare-agent-memory", saved["memory"]["provider"])
+        self.assertFalse(saved["memory"]["memory_enabled"])
+        self.assertFalse(saved["memory"]["user_profile_enabled"])
+        self.assertEqual(9, saved["memory"]["nudge_interval"])
+        self.assertEqual(42, saved["agent"]["max_turns"])
+        self.assertEqual((False, False), get_builtin_memory_store_flags(saved))
+        self.assertFalse(check_memory_requirements())
+        self.assertIn(
+            "hermes cloudflare-agent-memory migrate --dry-run",
+            stdout.getvalue(),
         )
+        self.assertIn(
+            "Local MEMORY.md and USER.md files were not changed",
+            stdout.getvalue(),
+        )
+
+    def test_post_setup_refuses_hermes_that_cannot_hide_the_builtin_memory_tool(
+        self,
+    ) -> None:
+        original_provider_config = (
+            self.home / "cloudflare-agent-memory.json"
+        ).read_text()
+        config = {"memory": {"provider": ""}}
+        stdout = io.StringIO()
+
+        with (
+            patch.object(
+                self.plugin,
+                "_supports_cloudflare_primary_mode",
+                return_value=False,
+            ),
+            patch(
+                "hermes_cli.memory_setup._prompt",
+                side_effect=AssertionError("setup must stop before prompting"),
+            ),
+            contextlib.redirect_stdout(stdout),
+        ):
+            self.provider.post_setup(str(self.home), config)
+
+        self.assertEqual({"memory": {"provider": ""}}, config)
+        self.assertEqual(
+            original_provider_config,
+            (self.home / "cloudflare-agent-memory.json").read_text(),
+        )
+        self.assertIn("upgrade Hermes", stdout.getvalue())
 
     def test_initialize_uses_runtime_identity_not_tool_arguments(self) -> None:
         expected = self.plugin.derived_profile_name("coder", "telegram", "42", "session-one")
@@ -413,13 +475,10 @@ class ProviderContractTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "Always use cloudflare_memory_remember for new durable memory.",
+            "Cloudflare Agent Memory is the only durable memory store.",
             prompt,
         )
-        self.assertIn(
-            "Use Hermes' built-in memory tool only to edit existing curated memory.",
-            prompt,
-        )
+        self.assertNotIn("built-in memory", prompt.lower())
         self.assertIn("primary save tool", remember["description"].lower())
 
     def test_recall_returns_answer_and_candidates(self) -> None:
@@ -679,7 +738,7 @@ class ProviderContractTests(unittest.TestCase):
         self.assertEqual("DELETE", self.server.requests[-1]["method"])
         self.assertIn(f"/profiles/{self.provider._profile}/memories/mem%2Fone", self.server.requests[-1]["path"])
 
-    def test_forget_rejects_recalled_curated_memory(self) -> None:
+    def test_forget_deletes_recalled_curated_memory(self) -> None:
         self.server.queue(
             200,
             {
@@ -704,6 +763,15 @@ class ProviderContractTests(unittest.TestCase):
         )
         self.provider.handle_tool_call("cloudflare_memory_recall", {"query": "durable"})
         request_count = len(self.server.requests)
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {"id": "durable"},
+                "errors": [],
+                "messages": [],
+            },
+        )
 
         result = json.loads(
             self.provider.handle_tool_call(
@@ -711,9 +779,13 @@ class ProviderContractTests(unittest.TestCase):
             )
         )
 
-        self.assertIn("error", result)
-        self.assertIn("Hermes memory", result["error"])
-        self.assertEqual(request_count, len(self.server.requests))
+        self.assertEqual({"forgotten": True, "id": "durable"}, result)
+        self.assertEqual(request_count + 1, len(self.server.requests))
+        self.assertEqual("DELETE", self.server.requests[-1]["method"])
+        self.assertIn(
+            f"/profiles/{self.provider._curated_profile}/memories/durable",
+            self.server.requests[-1]["path"],
+        )
 
     def test_latest_runtime_recall_replaces_stale_curated_authorization(self) -> None:
         recall_results = [
@@ -950,6 +1022,51 @@ class ProviderContractTests(unittest.TestCase):
             },
             manager.get_all_tool_names(),
         )
+
+    def test_current_hermes_primary_mode_hides_only_the_builtin_memory_tool(self) -> None:
+        plugin_dir = self.home / "plugins" / "cloudflare-agent-memory"
+        plugin_dir.mkdir(parents=True)
+        for name in ("__init__.py", "client.py", "plugin.yaml"):
+            shutil.copy2(ROOT / name, plugin_dir / name)
+        (self.home / "config.yaml").write_text(
+            "memory:\n"
+            "  provider: cloudflare-agent-memory\n"
+            "  memory_enabled: false\n"
+            "  user_profile_enabled: false\n",
+            encoding="utf-8",
+        )
+
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            base_url="https://example.invalid/v1",
+            api_key="fixture",
+            provider="custom",
+            model="fixture",
+            enabled_toolsets=["memory"],
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_background_review=True,
+            session_id="cloudflare-primary-tool-surface",
+        )
+        try:
+            self.assertIsNone(agent._memory_store)
+            self.assertNotIn("memory", agent.valid_tool_names)
+            self.assertEqual(
+                {
+                    "cloudflare_memory_recall",
+                    "cloudflare_memory_remember",
+                    "cloudflare_memory_forget",
+                    "cloudflare_memory_summary",
+                },
+                agent.valid_tool_names,
+            )
+        finally:
+            agent.close()
+            import hermes_logging
+
+            hermes_logging._reset_queued_handlers()
+            hermes_logging._logging_initialized = False
 
 
 class ProviderLifecycleTests(unittest.TestCase):
@@ -1822,6 +1939,13 @@ class MigrationTests(unittest.TestCase):
         (self.home / "cloudflare-agent-memory.json").write_text(
             json.dumps({"account_id": "account", "namespace": "namespace"})
         )
+        (self.home / "config.yaml").write_text(
+            "memory:\n"
+            "  provider: cloudflare-agent-memory\n"
+            "  memory_enabled: false\n"
+            "  user_profile_enabled: false\n",
+            encoding="utf-8",
+        )
         memory_dir = self.home / "memories"
         memory_dir.mkdir()
         (memory_dir / "MEMORY.md").write_text(
@@ -2456,6 +2580,189 @@ class ProviderCliTests(unittest.TestCase):
 
         self.assertEqual(0, result)
         self.assertNotIn("DELETE", [request["method"] for request in self.server.requests])
+
+    def test_export_writes_all_full_memories_without_remote_changes(self) -> None:
+        first = {
+            "id": "memory-one",
+            "type": "instruction",
+            "summary": "Uses concise answers",
+            "content": "The user prefers concise answers.",
+            "sessionId": "session-one",
+            "createdAt": "2026-08-27T10:00:00Z",
+            "updatedAt": "2026-08-27T10:00:00Z",
+        }
+        second = {
+            "id": "memory-two",
+            "type": "fact",
+            "summary": "Uses Neovim",
+            "content": "The user uses Neovim.",
+            "sessionId": "session-two",
+            "createdAt": "2026-08-27T11:00:00Z",
+            "updatedAt": "2026-08-27T11:00:00Z",
+        }
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": [{key: first[key] for key in first if key != "content"}],
+                "result_info": {"cursor": "next-page"},
+                "errors": [],
+                "messages": [],
+            },
+        )
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": first,
+                "errors": [],
+                "messages": [],
+            },
+        )
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": [{key: second[key] for key in second if key != "content"}],
+                "result_info": {"cursor": ""},
+                "errors": [],
+                "messages": [],
+            },
+        )
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": second,
+                "errors": [],
+                "messages": [],
+            },
+        )
+        output = self.home / "cloudflare-memory.jsonl"
+        args = argparse.Namespace(
+            cloudflare_memory_command="export",
+            output=output,
+            profile=None,
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            patch.object(self.cli, "_load_provider", return_value=self.provider),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = self.cli.cloudflare_memory_command(args)
+
+        self.assertEqual(0, result)
+        self.assertTrue(output.exists())
+        rows = [json.loads(line) for line in output.read_text().splitlines()]
+        self.assertEqual(
+            {
+                "format": "cloudflare-agent-memory-export",
+                "version": 1,
+                "namespace": "namespace",
+                "profiles": [self.provider._profile],
+            },
+            rows[0],
+        )
+        self.assertEqual(
+            [
+                {"profile": self.provider._profile, "memory": first},
+                {"profile": self.provider._profile, "memory": second},
+            ],
+            rows[1:],
+        )
+        self.assertIn(f"Exported 2 memories to {output}", stdout.getvalue())
+        self.assertEqual("", stderr.getvalue())
+        self.assertEqual({"GET"}, {request["method"] for request in self.server.requests})
+
+    def test_export_cli_accepts_an_output_and_multiple_profiles(self) -> None:
+        output = self.home / "selected-profiles.jsonl"
+
+        try:
+            result, _stdout, stderr = self._run(
+                [
+                    "export",
+                    "--output",
+                    str(output),
+                    "--profile",
+                    "profile-one",
+                    "--profile",
+                    "profile-two",
+                ]
+            )
+        except SystemExit:
+            self.fail("export CLI command is not registered")
+
+        header = json.loads(output.read_text().splitlines()[0])
+        self.assertEqual(0, result)
+        self.assertEqual(["profile-one", "profile-two"], header["profiles"])
+        self.assertEqual("", stderr)
+        paths = [request["path"] for request in self.server.requests]
+        self.assertTrue(any("/profiles/profile-one/memories?" in path for path in paths))
+        self.assertTrue(any("/profiles/profile-two/memories?" in path for path in paths))
+
+    def test_export_does_not_publish_a_malformed_memory_response(self) -> None:
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": [
+                    {
+                        "id": "memory-one",
+                        "type": "fact",
+                        "summary": "Uses Neovim",
+                        "sessionId": "session-one",
+                        "createdAt": "2026-08-27T11:00:00Z",
+                        "updatedAt": "2026-08-27T11:00:00Z",
+                    }
+                ],
+                "result_info": {"cursor": ""},
+                "errors": [],
+                "messages": [],
+            },
+        )
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {"content": "The user uses Neovim."},
+                "errors": [],
+                "messages": [],
+            },
+        )
+        output = self.home / "malformed.jsonl"
+
+        result, _stdout, stderr = self._run(
+            ["export", "--output", str(output)]
+        )
+
+        self.assertEqual(1, result)
+        self.assertFalse(output.exists())
+        self.assertIn("memory response ID does not match", stderr)
+        self.assertEqual([], list(self.home.glob(".malformed.jsonl.*")))
+
+    def test_export_does_not_treat_a_malformed_list_as_empty(self) -> None:
+        self.server.queue(
+            200,
+            {
+                "success": True,
+                "result": {},
+                "result_info": {"cursor": ""},
+                "errors": [],
+                "messages": [],
+            },
+        )
+        output = self.home / "malformed-list.jsonl"
+
+        result, _stdout, stderr = self._run(
+            ["export", "--output", str(output)]
+        )
+
+        self.assertEqual(1, result)
+        self.assertFalse(output.exists())
+        self.assertIn("invalid memory list response", stderr)
 
     def test_migrate_defaults_to_dry_run(self) -> None:
         result, stdout, _stderr = self._run(["migrate"])

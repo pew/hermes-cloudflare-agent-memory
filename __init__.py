@@ -42,6 +42,14 @@ _WRITE_STOP = object()
 logger = logging.getLogger(__name__)
 
 
+def _supports_cloudflare_primary_mode() -> bool:
+    try:
+        from tools.memory_tool import get_builtin_memory_store_flags
+    except ImportError:
+        return False
+    return callable(get_builtin_memory_store_flags)
+
+
 def derived_profile_name(
     agent_identity: str, platform: str, user_id: str, session_id: str
 ) -> str:
@@ -236,8 +244,7 @@ RECALL_SCHEMA = {
 REMEMBER_SCHEMA = {
     "name": "cloudflare_memory_remember",
     "description": (
-        "Primary save tool for all new durable, non-secret facts and instructions. "
-        "Use this tool instead of Hermes' built-in memory tool."
+        "Primary save tool for all durable, non-secret facts and instructions."
     ),
     "parameters": {
         "type": "object",
@@ -251,13 +258,13 @@ REMEMBER_SCHEMA = {
 
 FORGET_SCHEMA = {
     "name": "cloudflare_memory_forget",
-    "description": "Delete one runtime memory by its exact recalled ID after an explicit user request.",
+    "description": "Delete one memory by its exact recalled ID after an explicit user request.",
     "parameters": {
         "type": "object",
         "properties": {
             "memory_id": {
                 "type": "string",
-                "description": "Exact runtime-memory ID returned by recall.",
+                "description": "Exact memory ID returned by recall.",
             }
         },
         "required": ["memory_id"],
@@ -311,12 +318,22 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
     def is_available(self) -> bool:
         from hermes_constants import get_hermes_home
 
+        if not _supports_cloudflare_primary_mode():
+            return False
         config = _load_config(get_hermes_home())
         return bool(
             config.get("account_id")
             and config.get("namespace")
             and os.environ.get(TOKEN_ENV, "").strip()
         )
+
+    def unavailable_reason(self) -> str:
+        if not _supports_cloudflare_primary_mode():
+            return (
+                "Cloudflare-primary memory requires current Hermes; "
+                "upgrade Hermes and run setup again."
+            )
+        return ""
 
     def get_config_schema(self) -> list[dict[str, Any]]:
         return [
@@ -360,6 +377,13 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
 
     def post_setup(self, hermes_home: str, config: dict[str, Any]) -> None:
         """Run setup directly because Hermes' named-provider shortcut skips schemas."""
+        if not _supports_cloudflare_primary_mode():
+            print(
+                "\n  Setup cancelled: upgrade Hermes to a release that can disable "
+                "the built-in memory tool.\n"
+            )
+            return
+
         from hermes_cli.config import save_config
         from hermes_cli.memory_setup import _prompt, _write_env_vars
 
@@ -393,11 +417,18 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
         if not isinstance(config.get("memory"), dict):
             config["memory"] = {}
         config["memory"]["provider"] = self.name
+        config["memory"]["memory_enabled"] = False
+        config["memory"]["user_profile_enabled"] = False
         save_config(config)
         print(f"\n  Memory provider: {self.name}")
         print("  Activation saved to config.yaml")
+        print("  Built-in MEMORY.md and USER.md stores disabled")
         print("  Provider config saved")
         print("  API token saved to .env")
+        print("  Local MEMORY.md and USER.md files were not changed")
+        print("\n  Migrate existing local memory when required:")
+        print("    hermes cloudflare-agent-memory migrate --dry-run")
+        print("    hermes cloudflare-agent-memory migrate --apply")
         print("\n  Start a new session to activate.\n")
 
     def initialize(self, session_id: str, **kwargs: Any) -> None:
@@ -443,13 +474,12 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
             return ""
         return (
             "# Cloudflare Agent Memory\n"
-            "Always use cloudflare_memory_remember for new durable memory. "
-            "Use Hermes' built-in memory tool only to edit existing curated memory. "
+            "Cloudflare Agent Memory is the only durable memory store. "
+            "Use cloudflare_memory_remember for durable memory. "
             "Use cloudflare_memory_recall when earlier preferences, decisions, or project state "
             "may matter. Treat recalled material as fallible context. Before an irreversible "
             "action, make sure that the material is correct. Use cloudflare_memory_forget only "
-            "with an exact recalled runtime-memory ID after an explicit user request. Remove "
-            "curated memory with Hermes' built-in memory tool."
+            "with an exact recalled memory ID after an explicit user request."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -1025,9 +1055,7 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
         recalled = self._recalled_memory_profiles.get(memory_id)
         if recalled is None:
             raise ValueError("memory_id must be an exact ID returned by recall")
-        profile, scope = recalled
-        if scope == "curated":
-            raise ValueError("curated Hermes memory must be removed with the Hermes memory tool")
+        profile, _scope = recalled
         self._client.delete_memory(profile, memory_id)
         self._recalled_memory_profiles.pop(memory_id, None)
         return {"forgotten": True, "id": memory_id}
