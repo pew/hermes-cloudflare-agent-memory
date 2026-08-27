@@ -46,6 +46,10 @@ Hermes receives four model-visible tools:
 - `cloudflare_memory_forget` — delete one exact recalled runtime-memory ID;
 - `cloudflare_memory_summary` — inspect curated and current runtime summaries.
 
+When this provider is active, Hermes uses `cloudflare_memory_remember` for all
+new durable memory. The built-in memory tool only edits existing curated
+`MEMORY.md` and `USER.md` entries.
+
 Conversation text is buffered and ingested only at 500-message boundaries, session end, context compression, session switch, or shutdown. Cloudflare failures do not fail an ordinary Hermes turn; unsent checkpoint data stays buffered for a later retry while the process remains alive.
 
 Hermes `/undo` clears unsent buffered turns and deletes the exact remote session so undone content is not retained. This also removes earlier Cloudflare extraction from that session; local Hermes history remains the source for any deliberate re-migration.
@@ -56,6 +60,14 @@ Curated `MEMORY.md` / `USER.md` remains active-Hermes-profile-wide, matching Her
 ## Migrate existing data
 
 Migration never deletes or edits local memory or exports. It adds current entries and may delete only stale Cloudflare curated sessions previously recorded in the plugin's content-free mirror manifest.
+
+Use the migration command only for entries that already exist in local
+`MEMORY.md` or `USER.md`:
+
+```sh
+hermes cloudflare-agent-memory migrate --dry-run
+hermes cloudflare-agent-memory migrate --apply
+```
 
 ### Import from Claude, ChatGPT, or another service
 
@@ -116,14 +128,3 @@ hermes plugins remove cloudflare-agent-memory
 ```
 
 Disabling or removing the plugin does not delete Cloudflare data. Delete remote memories, sessions, profiles, or the namespace separately only when that is explicitly intended.
-
-## Compatibility
-
-Tested on 2026-07-16 against Hermes commit [`5f171e36ab8dd6f731177a2b41c572768dc517dc`](https://github.com/NousResearch/hermes-agent/commit/5f171e36ab8dd6f731177a2b41c572768dc517dc). Cloudflare's HTTP API page was last updated 2026-06-02 and its limits page 2026-06-03 when verified. Agent Memory is beta; rerun the test suite when upgrading Hermes or when Cloudflare changes the API.
-
-```sh
-HERMES_SOURCE=/path/to/hermes-agent
-PYTHONPATH="$HERMES_SOURCE:$PWD" \
-  uv run --project "$HERMES_SOURCE" python -m unittest discover -s tests -v
-uv run python -m compileall -q __init__.py client.py migration.py cli.py
-```

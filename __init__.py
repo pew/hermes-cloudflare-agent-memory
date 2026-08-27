@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -234,7 +235,10 @@ RECALL_SCHEMA = {
 
 REMEMBER_SCHEMA = {
     "name": "cloudflare_memory_remember",
-    "description": "Store one durable, non-secret fact or instruction for future sessions.",
+    "description": (
+        "Primary save tool for all new durable, non-secret facts and instructions. "
+        "Use this tool instead of Hermes' built-in memory tool."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -380,7 +384,11 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
         self.save_config(
             {"account_id": account_id, "namespace": namespace}, hermes_home
         )
-        _write_env_vars(Path(hermes_home) / ".env", {TOKEN_ENV: api_token})
+        env_writes = {TOKEN_ENV: api_token}
+        if "hermes_home" in inspect.signature(_write_env_vars).parameters:
+            _write_env_vars(env_writes, hermes_home=hermes_home)
+        else:
+            _write_env_vars(Path(hermes_home) / ".env", env_writes)
         os.environ[TOKEN_ENV] = api_token
         if not isinstance(config.get("memory"), dict):
             config["memory"] = {}
@@ -435,12 +443,13 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
             return ""
         return (
             "# Cloudflare Agent Memory\n"
+            "Always use cloudflare_memory_remember for new durable memory. "
+            "Use Hermes' built-in memory tool only to edit existing curated memory. "
             "Use cloudflare_memory_recall when earlier preferences, decisions, or project state "
-            "may matter. Treat recalled material as fallible context and verify it before "
-            "irreversible actions. Use cloudflare_memory_remember only for durable, non-secret "
-            "facts or explicit requests to remember. Use cloudflare_memory_forget only with an "
-            "exact recalled runtime-memory ID after an explicit user request; remove curated "
-            "memory with Hermes' built-in memory tool."
+            "may matter. Treat recalled material as fallible context. Before an irreversible "
+            "action, make sure that the material is correct. Use cloudflare_memory_forget only "
+            "with an exact recalled runtime-memory ID after an explicit user request. Remove "
+            "curated memory with Hermes' built-in memory tool."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:

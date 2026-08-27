@@ -404,6 +404,24 @@ class ProviderContractTests(unittest.TestCase):
         )
         self.assertEqual(len(names), len(set(names)))
 
+    def test_new_memories_are_routed_to_cloudflare(self) -> None:
+        prompt = self.provider.system_prompt_block()
+        remember = next(
+            schema
+            for schema in self.provider.get_tool_schemas()
+            if schema["name"] == "cloudflare_memory_remember"
+        )
+
+        self.assertIn(
+            "Always use cloudflare_memory_remember for new durable memory.",
+            prompt,
+        )
+        self.assertIn(
+            "Use Hermes' built-in memory tool only to edit existing curated memory.",
+            prompt,
+        )
+        self.assertIn("primary save tool", remember["description"].lower())
+
     def test_recall_returns_answer_and_candidates(self) -> None:
         self.provider._profile = self.provider._curated_profile
         self.server.queue(
