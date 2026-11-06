@@ -39,6 +39,7 @@ def _load_provider() -> Any:
 def _memory_count(provider: CloudflareAgentMemoryProvider) -> int:
     count = 0
     cursor = ""
+    seen_cursors = set()
     while True:
         try:
             page = provider._client.list_memories(provider._profile, cursor=cursor)
@@ -51,6 +52,9 @@ def _memory_count(provider: CloudflareAgentMemoryProvider) -> int:
         cursor = str((page.get("result_info") or {}).get("cursor") or "")
         if not cursor:
             return count
+        if cursor in seen_cursors:
+            raise ValueError("memory list returned a repeated cursor")
+        seen_cursors.add(cursor)
 
 
 def _export_memories(
@@ -111,6 +115,8 @@ def _export_memories(
                             raise ValueError(
                                 f"memory response ID does not match: {memory_id}"
                             )
+                        if not isinstance(memory.get("content"), str):
+                            raise ValueError(f"memory response has no full content: {memory_id}")
                         write({"profile": profile, "memory": memory})
                         count += 1
                     cursor = str((page.get("result_info") or {}).get("cursor") or "")

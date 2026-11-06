@@ -308,6 +308,7 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
         self._failed_curated_lock = threading.Lock()
         self._pending_session_deletes: set[tuple[str, str, str]] = set()
         self._session_generations: dict[tuple[str, str, str], int] = {}
+        self._unsaved_delete_state: dict[tuple[str, str, str], tuple[int, bool]] = {}
         self._pending_delete_lock = threading.Lock()
         self._shutdown_timeout = 5.0
 
@@ -464,7 +465,10 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
                 )
             except ValueError as exc:
                 logger.warning("Cloudflare Agent Memory configuration is invalid: %s", exc)
-        self._curated_snapshot = self._read_curated_entries()
+        try:
+            self._curated_snapshot = self._read_curated_entries()
+        except ValueError:
+            logger.warning("Cloudflare curated-memory source is unreadable; mirror paused")
         self._refresh_delete_state()
         if self._write_enabled and self._client:
             self._start_write_worker()
@@ -501,9 +505,14 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
         }
 
     def _refresh_delete_state(self) -> None:
-        state = _load_delete_state(self._hermes_home)
         with self._pending_delete_lock:
-            self._set_delete_state_cache(state)
+            self._set_delete_state_cache(self._delete_state_with_unsaved())
+
+    def _delete_state_with_unsaved(self) -> dict[tuple[str, str, str], tuple[int, bool]]:
+        state = _load_delete_state(self._hermes_home)
+        for key, (generation, pending) in self._unsaved_delete_state.items():
+            state[key] = (max(generation, state.get(key, (0, False))[0]), pending)
+        return state
 
     def sync_turn(
         self,
@@ -662,18 +671,6 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
             destination,
         )
 
-    def _delete_session_or_defer(
-        self, profile: str, session_id: str, *, require_pending: bool = False
-    ) -> bool:
-        if not self._client:
-            return False
-        with self._remote_session_lock:
-            with self._cross_process_remote_lock():
-                self._refresh_delete_state()
-                return self._delete_session_or_defer_locked(
-                    profile, session_id, require_pending=require_pending
-                )
-
     def _delete_session_or_defer_locked(
         self, profile: str, session_id: str, *, require_pending: bool
     ) -> bool:
@@ -691,12 +688,12 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
                 except CloudflareMemoryError:
                     pass
                 else:
-                    self._update_pending_delete(
+                    state_saved = self._update_pending_delete(
                         remove=key,
                         retain_generation=bool(self._session_generations.get(key)),
                     )
-                    self._remove_curated_manifest_session(key)
-                    return True
+                    manifest_saved = self._remove_curated_manifest_session(key)
+                    return state_saved and manifest_saved
             self._update_pending_delete(add=key)
             session_hash = hashlib.sha256(session_id.encode()).hexdigest()[:12]
             logger.warning(
@@ -705,28 +702,30 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
                 exc,
             )
             return False
-        self._update_pending_delete(
+        state_saved = self._update_pending_delete(
             remove=key,
             retain_generation=bool(self._session_generations.get(key)),
         )
-        self._remove_curated_manifest_session(key)
-        return True
+        manifest_saved = self._remove_curated_manifest_session(key)
+        return state_saved and manifest_saved
 
     def _record_rewind(self, key: tuple[str, str, str]) -> int:
         path = Path(self._hermes_home) / PENDING_FILENAME
         try:
             with self._pending_delete_lock:
                 with MemoryStore._file_lock(path):
-                    state = _load_delete_state(self._hermes_home)
+                    state = self._delete_state_with_unsaved()
                     generation = state.get(key, (0, False))[0] + 1
                     state[key] = (generation, True)
                     _persist_delete_state(path, state)
+                    self._unsaved_delete_state.clear()
                     self._set_delete_state_cache(state)
         except OSError as exc:
             with self._pending_delete_lock:
                 generation = self._session_generations.get(key, 0) + 1
                 self._session_generations[key] = generation
                 self._pending_session_deletes.add(key)
+                self._unsaved_delete_state[key] = (generation, True)
             logger.warning(
                 "Cloudflare Agent Memory could not persist rewind generation: %s",
                 exc.__class__.__name__,
@@ -739,12 +738,12 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
         add: tuple[str, str, str] | None = None,
         remove: tuple[str, str, str] | None = None,
         retain_generation: bool = False,
-    ) -> None:
+    ) -> bool:
         path = Path(self._hermes_home) / PENDING_FILENAME
         try:
             with self._pending_delete_lock:
                 with MemoryStore._file_lock(path):
-                    state = _load_delete_state(self._hermes_home)
+                    state = self._delete_state_with_unsaved()
                     if add:
                         generation = state.get(
                             add, (self._session_generations.get(add, 0), False)
@@ -760,17 +759,21 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
                         else:
                             state.pop(remove, None)
                     _persist_delete_state(path, state)
+                    self._unsaved_delete_state.clear()
                     self._set_delete_state_cache(state)
+            return True
         except OSError as exc:
             with self._pending_delete_lock:
                 if add:
                     self._pending_session_deletes.add(add)
-                if remove:
-                    self._pending_session_deletes.discard(remove)
+                    self._unsaved_delete_state[add] = (
+                        self._session_generations.get(add, 0), True
+                    )
             logger.warning(
                 "Cloudflare Agent Memory could not persist pending deletes: %s",
                 exc.__class__.__name__,
             )
+            return False
 
     def _retry_pending_session_deletes(self) -> None:
         if not self._client or not self._write_enabled:
@@ -785,29 +788,53 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
                 if item[0] == destination_id
             ]
         for _destination_id, profile, session_id in pending:
-            self._delete_session_or_defer(
-                profile, session_id, require_pending=True
-            )
+            with self._remote_session_lock, self._cross_process_remote_lock():
+                self._refresh_delete_state()
+                key = (_destination_id, profile, session_id)
+                if key not in self._pending_session_deletes:
+                    continue
+                if profile == self._curated_profile and session_id.startswith("hermes-memory-"):
+                    try:
+                        current = self._read_curated_entries()
+                    except ValueError:
+                        logger.warning("Cloudflare curated-memory source is unreadable; delete deferred")
+                        continue
+                    if any(
+                        curated_session_id(target, content) == session_id
+                        for target, entries in current.items()
+                        for content in entries
+                    ):
+                        self._update_pending_delete(remove=key)
+                        continue
+                self._delete_session_or_defer_locked(
+                    profile, session_id, require_pending=True
+                )
 
     def _remove_curated_manifest_session(
         self, key: tuple[str, str, str]
-    ) -> None:
+    ) -> bool:
         try:
             _update_curated_manifest(self._hermes_home, remove_session=key)
+            return True
         except OSError as exc:
             logger.warning(
                 "Cloudflare curated-memory state cleanup failed: %s",
                 exc.__class__.__name__,
             )
+            return False
 
-    @staticmethod
-    def _read_curated_entries() -> dict[str, set[str]]:
+    def _read_curated_entries(self) -> dict[str, set[str]]:
         store = MemoryStore()
-        store.load_from_disk()
-        return {
-            "memory": set(store.memory_entries),
-            "user": set(store.user_entries),
-        }
+        entries = {}
+        for target in ("memory", "user"):
+            filename = "USER.md" if target == "user" else "MEMORY.md"
+            raw, read_ok = store._read_raw_checked(
+                Path(self._hermes_home) / "memories" / filename
+            )
+            if not read_ok:
+                raise ValueError("curated memory source is unreadable")
+            entries[target] = set(store._parse_entries(raw))
+        return entries
 
     def _start_write_worker(self) -> None:
         if self._write_worker and self._write_worker.is_alive():
@@ -864,7 +891,10 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
                 with self._pending_delete_lock:
                     delete_pending = key in self._pending_session_deletes
                 if delete_pending:
-                    self._update_pending_delete(remove=key)
+                    if not self._update_pending_delete(remove=key):
+                        raise CloudflareMemoryError(
+                            "curated deletion cancellation could not be persisted"
+                        )
                 return self._remember_curated(profile, target, content)
 
     def _remember_curated(self, profile: str, target: str, content: str) -> bool:
@@ -909,6 +939,7 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
 
     def _session_has_memories(self, profile: str, session_id: str) -> bool:
         cursor = ""
+        seen_cursors = set()
         while True:
             try:
                 page = self._client.list_memories(
@@ -924,6 +955,9 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
             cursor = str((page.get("result_info") or {}).get("cursor") or "")
             if not cursor:
                 return False
+            if cursor in seen_cursors:
+                raise CloudflareMemoryError("memory list returned a repeated cursor")
+            seen_cursors.add(cursor)
 
     def _retry_failed_curated_operations(self) -> None:
         with self._failed_curated_lock:
@@ -942,7 +976,11 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
         del metadata
         if not self._write_enabled or not self._client or target not in {"memory", "user"}:
             return
-        current = self._read_curated_entries()
+        try:
+            current = self._read_curated_entries()
+        except ValueError:
+            logger.warning("Cloudflare curated-memory source is unreadable; mirror paused")
+            return
         with self._curated_state_lock:
             previous = self._curated_snapshot
             removed = previous[target] - current[target]
@@ -974,64 +1012,48 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
         if not self._write_enabled:
             raise ValueError("writes are disabled outside the primary agent context")
 
-    def _read_profiles(self) -> list[tuple[str, str]]:
-        if self._curated_profile == self._profile:
-            return [("runtime", self._profile)]
-        return [("curated", self._curated_profile), ("runtime", self._profile)]
-
     def _tool_recall(self, args: dict[str, Any]) -> dict:
         query = sanitize_context(str(args.get("query") or ""))
         query = redact_sensitive_text(query, force=True).strip()
         if not query:
             raise ValueError("query is required")
-        profiles = self._read_profiles()
-        answers = []
+        try:
+            result = self._client.recall(self._profile, query)
+        except CloudflareMemoryError as exc:
+            if exc.status != 404:
+                raise
+            self._client.get_namespace()
+            return {"answer": "", "count": 0, "candidates": []}
+        answer = str(result.get("answer") or "")
         candidates = []
-        seen_ids = set()
         recalled_profiles: dict[str, tuple[str, str]] = {}
         curated_sessions = {
-            (profile, session_id)
+            session_id
             for destination_id, profile, _target, _source_hash, session_id in _load_curated_manifest(
                 self._hermes_home
             )
             if destination_id == self._client.destination_id
+            and profile == self._profile
         }
-        for scope, profile in profiles:
-            try:
-                result = self._client.recall(profile, query)
-            except CloudflareMemoryError as exc:
-                if exc.status != 404:
-                    raise
-                self._client.get_namespace()
+        for item in result.get("candidates") or []:
+            if not isinstance(item, dict):
                 continue
-            answer = str(result.get("answer") or "")
-            if answer:
-                title = "Durable memory" if scope == "curated" else "Runtime identity"
-                answers.append(f"## {title}\n{answer}")
-            for item in result.get("candidates") or []:
-                if not isinstance(item, dict):
-                    continue
-                memory_id = item.get("id")
-                if isinstance(memory_id, str) and memory_id:
-                    if memory_id in seen_ids:
-                        continue
-                    seen_ids.add(memory_id)
-                item_scope = scope
-                if (
-                    len(profiles) == 1
-                    and (profile, str(item.get("sessionId") or "")) in curated_sessions
-                ):
-                    item_scope = "curated"
-                candidate = {
-                    key: item[key] for key in ("id", "summary", "score") if key in item
-                }
-                candidate["scope"] = item_scope
-                candidates.append(candidate)
-                if isinstance(memory_id, str) and memory_id:
-                    recalled_profiles[memory_id] = (profile, item_scope)
+            scope = (
+                "curated"
+                if str(item.get("sessionId") or "") in curated_sessions
+                else "runtime"
+            )
+            candidate = {
+                key: item[key] for key in ("id", "summary", "score") if key in item
+            }
+            candidate["scope"] = scope
+            candidates.append(candidate)
+            memory_id = item.get("id")
+            if isinstance(memory_id, str) and memory_id:
+                recalled_profiles[memory_id] = (self._profile, scope)
         self._recalled_memory_profiles.update(recalled_profiles)
         return {
-            "answer": "\n\n".join(answers),
+            "answer": f"## Runtime identity\n{answer}" if answer else "",
             "count": len(candidates),
             "candidates": candidates,
         }
@@ -1041,6 +1063,8 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
         content = str(args.get("content") or "").strip()
         if not content:
             raise ValueError("content is required")
+        if scan_for_threats(content, scope="strict"):
+            raise ValueError("content blocked by strict threat scan")
         content = redact_sensitive_text(content, force=True).strip()
         if not content:
             raise ValueError("content is empty after redaction")
@@ -1061,25 +1085,14 @@ class CloudflareAgentMemoryProvider(MemoryProvider):
         return {"forgotten": True, "id": memory_id}
 
     def _tool_summary(self) -> dict[str, str]:
-        profiles = self._read_profiles()
-        summaries = []
-        for scope, profile in profiles:
-            try:
-                summary = self._client.summary(profile)
-            except CloudflareMemoryError as exc:
-                if exc.status != 404:
-                    raise
-                self._client.get_namespace()
-                continue
-            if not summary:
-                continue
-            title = (
-                "Durable curated memory"
-                if scope == "curated"
-                else "Runtime identity memory"
-            )
-            summaries.append(f"## {title}\n{summary}")
-        return {"summary": "\n\n".join(summaries)}
+        try:
+            summary = self._client.summary(self._profile)
+        except CloudflareMemoryError as exc:
+            if exc.status != 404:
+                raise
+            self._client.get_namespace()
+            return {"summary": ""}
+        return {"summary": f"## Runtime identity memory\n{summary}" if summary else ""}
 
     def _current_profile_delete_pending(self) -> bool:
         if not self._client:

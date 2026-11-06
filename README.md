@@ -59,7 +59,7 @@ Conversation text is buffered and ingested only at 500-message boundaries, sessi
 
 Hermes `/undo` clears unsent buffered turns and deletes the exact remote session so undone content is not retained. This also removes earlier Cloudflare extraction from that session; local Hermes history remains the source for any deliberate re-migration.
 
-Profiles are derived from trusted Hermes runtime identity. Identified gateway users are isolated by platform and user; unidentified non-CLI callers are isolated per session; local CLI sessions share the active Hermes profile's memory.
+Profiles are derived from trusted Hermes runtime identity. Identified gateway users read only their platform and user profile; unidentified non-CLI callers are isolated per session. Local CLI sessions share the active Hermes profile's memory, including migrated local entries.
 
 Setup does not edit or delete local `MEMORY.md` or `USER.md` files. Hermes no
 longer injects them after setup. Use the migration commands to copy their
@@ -154,9 +154,9 @@ hermes cloudflare-agent-memory export \
   --profile hermes-example-profile-two
 ```
 
-The current [Cloudflare HTTP API](https://developers.cloudflare.com/agent-memory/api/http-api/)
-does not provide profile enumeration. The default export therefore contains the
-active Hermes profile. Treat every export file as sensitive data.
+The default export contains the active Hermes profile. This command exports
+only that profile or the profiles selected with `--profile`. Treat every export
+file as sensitive data.
 
 ## Roll back, update, or remove
 

@@ -190,9 +190,15 @@ class CloudflareMemoryClient:
             )
         if include_result_info:
             info = payload.get("result_info")
+            if info is None:
+                info = {}
+            if not isinstance(info, dict) or (
+                info.get("cursor") is not None and not isinstance(info["cursor"], str)
+            ):
+                raise CloudflareMemoryError("invalid memory pagination response")
             return {
                 "result": payload.get("result"),
-                "result_info": info if isinstance(info, dict) else {},
+                "result_info": info,
             }
         return payload.get("result")
 
@@ -272,7 +278,9 @@ class CloudflareMemoryClient:
             query=query,
             include_result_info=True,
         )
-        return result if isinstance(result, dict) else {"result": [], "result_info": {}}
+        if not isinstance(result["result"], list):
+            raise CloudflareMemoryError("invalid memory list response")
+        return result
 
     def get_memory(self, profile: str, memory_id: str) -> dict:
         self._validate_profile(profile)

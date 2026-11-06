@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any
 
 from agent.memory_manager import sanitize_context
 from agent.redact import redact_sensitive_text
-from tools.memory_tool import MemoryStore
 from tools.threat_patterns import scan_for_threats
 
 from .client import (
@@ -111,17 +110,14 @@ def _curated_operations(
         derived_profile_name,
     )
 
-    store = MemoryStore()
-    store.load_from_disk()
+    entries_by_target = provider._read_curated_entries()
     profile = derived_profile_name(provider._agent_identity, "cli", "", "cloudflare-memory-cli")
     operations = []
     desired_sessions = set()
-    for target, entries in (
-        ("memory", store.memory_entries),
-        ("user", store.user_entries),
-    ):
-        for content in entries:
+    for target, entries in entries_by_target.items():
+        for content in sorted(entries):
             source_hash = _source_hash("curated", target, content)
+            desired_sessions.add(curated_session_id(target, content))
             if scan_for_threats(content, scope="strict"):
                 stats.skipped += 1
                 _reject(stats, source_hash, "remember", "threat_detected")
@@ -146,7 +142,6 @@ def _curated_operations(
                     "messages": None,
                 }
             )
-            desired_sessions.add(curated_session_id(target, content))
             stats.curated += 1
     destination_id = provider._client.destination_id
     for entry in sorted(_load_curated_manifest(provider._hermes_home)):
@@ -215,6 +210,8 @@ def _session_operations(
                 for message in raw_messages:
                     if not isinstance(message, dict):
                         continue
+                    if not message.get("active", True) and not message.get("compacted", False):
+                        continue
                     role = message.get("role")
                     if role not in {"user", "assistant"}:
                         continue
@@ -272,28 +269,6 @@ def plan_migration(
         operations.extend(_session_operations(provider, Path(sessions_jsonl), stats))
     stats.planned = len(operations)
     return operations, stats
-
-
-def _session_exists(provider: CloudflareAgentMemoryProvider, operation: dict) -> bool:
-    cursor = ""
-    while True:
-        try:
-            page = provider._client.list_memories(
-                operation["profile"],
-                session_id=operation["session_id"],
-                cursor=cursor,
-            )
-        except CloudflareMemoryError as exc:
-            if exc.status != 404:
-                raise
-            provider._client.get_namespace()
-            return False
-        if page.get("result"):
-            return True
-        info = page.get("result_info") or {}
-        cursor = str(info.get("cursor") or "")
-        if not cursor:
-            return False
 
 
 def _append_report(path: Path, record: dict) -> None:
@@ -371,7 +346,7 @@ def apply_migration(
     *,
     rejections: list[dict[str, str]] | None = None,
 ) -> MigrationStats:
-    from . import _update_curated_manifest
+    from . import _update_curated_manifest, curated_session_id
 
     if not provider._client:
         raise ValueError("Cloudflare Agent Memory is not configured")
@@ -394,64 +369,83 @@ def apply_migration(
             Path(report_path), _report_record(operation, status="planned")
         )
     blocked_ingest_sessions: set[tuple[str, str]] = set()
+    blocked_curated_targets: set[tuple[str, str]] = set()
     for operation in operations:
         status = "failed"
         error_code = ""
         kind = operation.get("kind")
         ingest_key = (operation.get("profile", ""), operation.get("session_id", ""))
-        if kind == "ingest" and ingest_key in blocked_ingest_sessions:
+        curated_key = (operation.get("profile", ""), operation.get("target", ""))
+        if (
+            kind == "ingest" and ingest_key in blocked_ingest_sessions
+        ) or (
+            kind == "delete" and curated_key in blocked_curated_targets
+        ):
             stats.failed += 1
             _write_report(
                 Path(report_path),
                 _report_record(
                     operation,
                     status="failed",
-                    error_code="prior_batch_failed",
+                    error_code="prior_batch_failed" if kind == "ingest" else "prior_remember_failed",
                 ),
             )
             continue
         try:
             if kind == "remember":
-                if _session_exists(provider, operation):
-                    status = "skipped"
-                    stats.skipped += 1
-                else:
-                    provider._client.remember(
-                        operation["profile"],
-                        operation["content"],
-                        operation["session_id"],
-                    )
-                    status = "applied"
-                    stats.applied += 1
-                _update_curated_manifest(
-                    provider._hermes_home,
-                    add=(
+                with provider._remote_session_lock, provider._cross_process_remote_lock():
+                    provider._refresh_delete_state()
+                    pending_key = (
                         provider._client.destination_id,
                         operation["profile"],
-                        operation["target"],
-                        operation["source_hash"],
                         operation["session_id"],
-                    ),
-                )
-            elif kind == "delete":
-                try:
-                    provider._client.delete_session(
+                    )
+                    if pending_key in provider._pending_session_deletes:
+                        provider._update_pending_delete(remove=pending_key)
+                        provider._refresh_delete_state()
+                        if pending_key in provider._pending_session_deletes:
+                            raise CloudflareMemoryError("curated deletion cancellation could not be persisted")
+                    exists = provider._session_has_memories(
                         operation["profile"], operation["session_id"]
                     )
-                except CloudflareMemoryError as exc:
-                    if exc.status != 404:
-                        raise
-                    provider._client.get_namespace()
-                _update_curated_manifest(
-                    provider._hermes_home,
-                    remove_session=(
-                        provider._client.destination_id,
-                        operation["profile"],
-                        operation["session_id"],
-                    ),
-                )
-                status = "applied"
-                stats.applied += 1
+                    if not exists:
+                        provider._client.remember(
+                            operation["profile"],
+                            operation["content"],
+                            operation["session_id"],
+                        )
+                    _update_curated_manifest(
+                        provider._hermes_home,
+                        add=(
+                            provider._client.destination_id,
+                            operation["profile"],
+                            operation["target"],
+                            operation["source_hash"],
+                            operation["session_id"],
+                        ),
+                    )
+                    if exists:
+                        status = "skipped"
+                        stats.skipped += 1
+                    else:
+                        status = "applied"
+                        stats.applied += 1
+            elif kind == "delete":
+                with provider._remote_session_lock, provider._cross_process_remote_lock():
+                    current_entries = provider._read_curated_entries()[operation["target"]]
+                    if any(
+                        curated_session_id(operation["target"], content) == operation["session_id"]
+                        for content in current_entries
+                    ):
+                        status = "skipped"
+                        stats.skipped += 1
+                    else:
+                        if not provider._delete_session_or_defer_locked(
+                            operation["profile"], operation["session_id"], require_pending=False
+                        ):
+                            raise CloudflareMemoryError("curated session deletion could not be completed")
+                        status = "applied"
+                        stats.applied += 1
             elif kind == "ingest":
                 _ingest_operation(provider, operation)
                 status = "applied"
@@ -463,6 +457,8 @@ def apply_migration(
             stats.failed += 1
             if kind == "ingest":
                 blocked_ingest_sessions.add(ingest_key)
+            elif kind == "remember":
+                blocked_curated_targets.add(curated_key)
             if isinstance(exc, CloudflareMemoryError) and exc.codes:
                 error_code = exc.codes[0]
             else:
